@@ -17,11 +17,14 @@ class RulerApp:
     def setup_visual_window(self):
         # --- Visual Window (The lines) ---
         self.visual_window = tk.Toplevel(self.root)
-        self.screen_width = self.root.winfo_screenwidth()
-        self.screen_height = self.root.winfo_screenheight()
+        # Virtual Screen Information for Multi-monitor support
+        self.v_screen_left = win32api.GetSystemMetrics(76) # SM_XVIRTUALSCREEN
+        self.v_screen_top = win32api.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        self.v_screen_width = win32api.GetSystemMetrics(78) # SM_CXVIRTUALSCREEN
+        self.v_screen_height = win32api.GetSystemMetrics(79) # SM_CYVIRTUALSCREEN
         
         self.visual_window.overrideredirect(True)
-        self.visual_window.geometry(f"{self.screen_width}x{self.screen_height}+0+0")
+        self.visual_window.geometry(f"{self.v_screen_width}x{self.v_screen_height}+{self.v_screen_left}+{self.v_screen_top}")
         self.visual_window.wm_attributes("-topmost", True)
         
         # Transparent background
@@ -36,14 +39,20 @@ class RulerApp:
             self.visual_window,
             bg=self.TRANS_COLOR,
             highlightthickness=0,
-            width=self.screen_width,
-            height=self.screen_height
+            width=self.v_screen_width,
+            height=self.v_screen_height
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Initial positions
-        self.cx = self.screen_width // 2
-        self.cy = self.screen_height // 2
+        # Initial positions (Center of the primary screen, or center of virtual screen?)
+        # Let's keep it simple and start at center of primary screen as before, 
+        # but we need to make sure we have those values.
+        # winfo_screenwidth/height return primary monitor size.
+        primary_w = self.root.winfo_screenwidth()
+        primary_h = self.root.winfo_screenheight()
+        
+        self.cx = primary_w // 2
+        self.cy = primary_h // 2
         self.ruler_width = 40 # Width of the ruler strip
         
         # Make Visual Window Click-Through using Win32 API
@@ -90,6 +99,57 @@ class RulerApp:
         
         # Ensure focus to receive key events
         self.root.focus_force()
+        
+        # Context Menu
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="次のモニターへ移動", command=self.move_to_next_monitor)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="終了", command=self.root.quit)
+        
+        self.root.bind("<Button-3>", self.show_context_menu)
+
+    def show_context_menu(self, event):
+        self.context_menu.post(event.x_root, event.y_root)
+
+    def get_all_monitors(self):
+        return win32api.EnumDisplayMonitors()
+
+    def get_current_monitor_rect(self):
+        try:
+            h_monitor = win32api.MonitorFromPoint((self.cx, self.cy), win32con.MONITOR_DEFAULTTONEAREST)
+            monitor_info = win32api.GetMonitorInfo(h_monitor)
+            return monitor_info['Monitor'] # (left, top, right, bottom)
+        except:
+            # Fallback to primary screen if something fails
+            return (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+
+    def move_to_next_monitor(self):
+        monitors = self.get_all_monitors()
+        if not monitors:
+            return
+            
+        current_h_monitor = win32api.MonitorFromPoint((self.cx, self.cy), win32con.MONITOR_DEFAULTTONEAREST)
+        
+        current_index = 0
+        for i, (h_monitor, _, _) in enumerate(monitors):
+            if h_monitor == current_h_monitor:
+                current_index = i
+                break
+        
+        next_index = (current_index + 1) % len(monitors)
+        next_monitor = monitors[next_index]
+        
+        # next_monitor is (hMonitor, hdcMonitor, PyRECT)
+        # PyRECT is (left, top, right, bottom)
+        rect = next_monitor[2]
+        left, top, right, bottom = rect
+        
+        # Move to center of new monitor
+        self.cx = (left + right) // 2
+        self.cy = (top + bottom) // 2
+        
+        self.update_handle_geometry()
+        self.draw_rulers()
 
     def move_by_key(self, dx, dy):
         self.cx += dx
@@ -116,34 +176,56 @@ class RulerApp:
         text_color = "black"
         font_spec = ("Arial", 8)
         
-        # Length to draw (enough to cover screen even if moved)
-        length_v = self.screen_height * 3
-        length_h = self.screen_width * 3
+        # Get current monitor bounds to clip lines
+        m_left, m_top, m_right, m_bottom = self.get_current_monitor_rect()
+        
+        # Coordinate transformation: Screen -> Canvas
+        # canvas_x = screen_x - self.v_screen_left
+        # canvas_y = screen_y - self.v_screen_top
+        
+        cx_canvas = self.cx - self.v_screen_left
+        cy_canvas = self.cy - self.v_screen_top
+        
+        # Calculate start/end points clipped to monitor
+        # Vertical ruler: x is constant (cx), y varies from m_top to m_bottom
+        v_start_y = m_top - self.v_screen_top
+        v_end_y = m_bottom - self.v_screen_top
+        
+        # Horizontal ruler: y is constant (cy), x varies from m_left to m_right
+        h_start_x = m_left - self.v_screen_left
+        h_end_x = m_right - self.v_screen_left
         
         # --- Vertical Ruler ---
         # Drawn to the LEFT of cx
         self.canvas.create_rectangle(
-            self.cx - self.ruler_width, self.cy - length_v//2,
-            self.cx, self.cy + length_v//2,
+            cx_canvas - self.ruler_width, v_start_y,
+            cx_canvas, v_end_y,
             fill=bg_color, outline="gray", tags="v_ruler"
         )
         
         # Ticks and Numbers
         # 0 is at cy. Up is negative, Down is positive.
-        start_y = - (length_v // 2)
-        end_y = length_v // 2
+        # We need to iterate from top of monitor to bottom of monitor relative to cy
         
-        for i in range(start_y, end_y, 10):
+        # range start/end relative to cy
+        range_start_y = m_top - self.cy
+        range_end_y = m_bottom - self.cy
+        
+        # Align to 10
+        range_start_y = (range_start_y // 10) * 10
+        
+        for i in range(range_start_y, range_end_y, 10):
             y_pos = self.cy + i
+            y_pos_canvas = y_pos - self.v_screen_top
             
             # Draw tick on the RIGHT edge of the vertical ruler (which is cx)
-            right_edge = self.cx
+            right_edge_canvas = cx_canvas
             
             if i % 100 == 0:
                 tick_len = self.ruler_width * 0.5
                 # Text
                 self.canvas.create_text(
-                    right_edge - tick_len - 2, y_pos + 2, # Text to the left of tick
+                    right_edge_canvas - tick_len - 2, y_pos_canvas + 2, # Text to the left of tick
                     text=str(abs(i)), anchor="ne", fill=text_color, font=font_spec, tags="v_ruler"
                 )
             elif i % 50 == 0:
@@ -152,31 +234,35 @@ class RulerApp:
                 tick_len = self.ruler_width * 0.15
             
             self.canvas.create_line(
-                right_edge, y_pos, right_edge - tick_len, y_pos, # Line leftwards from right edge
+                right_edge_canvas, y_pos_canvas, right_edge_canvas - tick_len, y_pos_canvas, # Line leftwards from right edge
                 fill=line_color, tags="v_ruler"
             )
 
         # --- Horizontal Ruler ---
         # Drawn BELOW cy
         self.canvas.create_rectangle(
-            self.cx - length_h//2, self.cy,
-            self.cx + length_h//2, self.cy + self.ruler_width,
+            h_start_x, cy_canvas,
+            h_end_x, cy_canvas + self.ruler_width,
             fill=bg_color, outline="gray", tags="h_ruler"
         )
         
-        start_x = - (length_h // 2)
-        end_x = length_h // 2
+        range_start_x = m_left - self.cx
+        range_end_x = m_right - self.cx
         
-        for i in range(start_x, end_x, 10):
+        # Align to 10
+        range_start_x = (range_start_x // 10) * 10
+        
+        for i in range(range_start_x, range_end_x, 10):
             x_pos = self.cx + i
+            x_pos_canvas = x_pos - self.v_screen_left
             
             # Draw tick on the TOP edge of the horizontal ruler (which is cy)
-            top_edge = self.cy
+            top_edge_canvas = cy_canvas
             
             if i % 100 == 0:
                 tick_len = self.ruler_width * 0.5
                 self.canvas.create_text(
-                    x_pos + 2, top_edge + tick_len + 2, # Text below tick
+                    x_pos_canvas + 2, top_edge_canvas + tick_len + 2, # Text below tick
                     text=str(abs(i)), anchor="nw", fill=text_color, font=font_spec, tags="h_ruler"
                 )
             elif i % 50 == 0:
@@ -185,7 +271,7 @@ class RulerApp:
                 tick_len = self.ruler_width * 0.15
             
             self.canvas.create_line(
-                x_pos, top_edge, x_pos, top_edge + tick_len, # Line downwards from top
+                x_pos_canvas, top_edge_canvas, x_pos_canvas, top_edge_canvas + tick_len, # Line downwards from top
                 fill=line_color, tags="h_ruler"
             )
 
@@ -203,8 +289,15 @@ class RulerApp:
         self.update_handle_geometry()
         
         # Move visual elements
-        self.canvas.move("v_ruler", dx, dy)
-        self.canvas.move("h_ruler", dx, dy)
+        # Move visual elements
+        # Instead of moving, we redraw because the clipping rect might change 
+        # if we drag near the edge (though user wants strict monitor clipping, 
+        # so dragging between monitors might be tricky if we don't redraw).
+        # But for smooth dragging within a monitor, moving is better.
+        # However, since we are implementing "Move to Next Monitor" as the primary way to switch,
+        # and dragging across might be ambiguous, let's just redraw to be safe and correct.
+        # It ensures lines stay clipped to the monitor the center is on.
+        self.draw_rulers()
         
         # Update drag start for next event (relative movement)
         self.drag_start_x = event.x_root
